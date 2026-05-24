@@ -1,0 +1,15 @@
+# Datos sensibles de estudiantes — NO subir a GitHub
+napsis/
+DIA/
+SEPA/
+proyectos/
+template/
+
+# Archivos de datos
+*.xlsx
+*.xls
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
