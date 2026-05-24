@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 actualizar_dashboard.py
 =======================
@@ -11,7 +11,7 @@ Uso:
   python actualizar_dashboard.py
 """
 
-import sys, re, json, unicodedata, difflib, io
+import sys, re, json, unicodedata, difflib, io, pickle, shutil
 from pathlib import Path
 from collections import defaultdict
 from datetime import date
@@ -26,6 +26,7 @@ import pdfplumber
 BASE_DIR     = Path(__file__).parent
 NAPSIS_DIR   = BASE_DIR / "napsis"
 ACTAS_DIR    = NAPSIS_DIR / "actas"        # TXT descargados desde sección Actas de NAPSIS
+CACHE_DIR    = NAPSIS_DIR / "cache"        # Caché binario de fuentes que no cambian frecuentemente
 DIA_DIR      = BASE_DIR / "DIA"
 SEPA_DIR     = BASE_DIR / "SEPA"
 TEMPLATE_DIR = BASE_DIR / "template"
@@ -360,6 +361,43 @@ def merge_repeaters(profiles, verbose=True):
 
 
 # ══════════════════════════════════════════════════════════════
+# CACHÉ DE FUENTES DE DATOS
+# ══════════════════════════════════════════════════════════════
+
+def _dir_fp(paths_globs):
+    """Huella digital de un conjunto de archivos: {ruta: (mtime, size)}."""
+    fp = {}
+    for dirpath, glob in paths_globs:
+        p = Path(dirpath)
+        if not p.exists():
+            continue
+        for f in p.glob(glob):
+            if f.is_file():
+                st = f.stat()
+                fp[str(f)] = (st.st_mtime, st.st_size)
+    return fp
+
+def _cache_load(name, paths_globs):
+    """Devuelve datos cacheados si la huella de archivos fuente no ha cambiado, o None."""
+    path = CACHE_DIR / f'{name}.pkl'
+    if not path.exists():
+        return None
+    try:
+        with open(path, 'rb') as fh:
+            saved = pickle.load(fh)
+        if saved.get('fp') == _dir_fp(paths_globs):
+            return saved['data']
+    except Exception:
+        pass
+    return None
+
+def _cache_save(name, data, paths_globs):
+    CACHE_DIR.mkdir(exist_ok=True)
+    with open(CACHE_DIR / f'{name}.pkl', 'wb') as fh:
+        pickle.dump({'data': data, 'fp': _dir_fp(paths_globs)}, fh)
+
+
+# ══════════════════════════════════════════════════════════════
 # LECTOR NAPSIS
 # ══════════════════════════════════════════════════════════════
 
@@ -632,32 +670,54 @@ def read_all_napsis():
         print('  ⚠  napsis/ no encontrada')
         return records
 
-    # Si existen archivos de Actas para el año actual, se usan en lugar de HTML
-    actas_disponibles = ACTAS_DIR.is_dir() and any(ACTAS_DIR.glob('a*_4_*.txt'))
-
-    for year_dir in sorted(NAPSIS_DIR.iterdir()):
-        if not year_dir.is_dir() or not year_dir.name.isdigit():
-            continue
-        year = int(year_dir.name)
-
-        if year == CURRENT_YEAR and actas_disponibles:
-            print(f'  NAPSIS {year} — leyendo desde Actas (napsis/actas/)...')
-            for rec in _parse_actas(ACTAS_DIR, year):
-                records.append(rec)
-                print(f'  NAPSIS {year} — {rec["grade_name"]:12s} '
-                      f'{rec["vigentes"]:3d} est.  prom {rec["pf_prom"]}')
-            continue
-
-        for f in sorted(year_dir.glob('*.xlsx')):
-            m = re.match(r'^(\d{2})A_Notas', f.name)
-            if not m:
+    # ── Histórico (años anteriores): desde caché si disponible ───────
+    hist_globs = [(NAPSIS_DIR, '[0-9][0-9][0-9][0-9]/*.xlsx')]
+    historical = _cache_load('napsis_historico', hist_globs)
+    if historical is not None:
+        print(f'  NAPSIS histórico — desde caché ({len(historical)} registros)')
+        records.extend(historical)
+    else:
+        historical = []
+        for year_dir in sorted(NAPSIS_DIR.iterdir()):
+            if not year_dir.is_dir() or not year_dir.name.isdigit():
                 continue
-            grade_num = int(m.group(1))
-            rec = _parse_napsis_file(f, year, grade_num)
-            if rec:
-                records.append(rec)
-                print(f'  NAPSIS {year} — {rec["grade_name"]:12s} '
-                      f'{rec["vigentes"]:3d} est.  prom {rec["pf_prom"]}')
+            if int(year_dir.name) == CURRENT_YEAR:
+                continue
+            for f in sorted(year_dir.glob('*.xlsx')):
+                m = re.match(r'^(\d{2})A_Notas', f.name)
+                if not m:
+                    continue
+                grade_num = int(m.group(1))
+                rec = _parse_napsis_file(f, int(year_dir.name), grade_num)
+                if rec:
+                    historical.append(rec)
+                    print(f'  NAPSIS {year_dir.name} — {rec["grade_name"]:12s} '
+                          f'{rec["vigentes"]:3d} est.  prom {rec["pf_prom"]}')
+        records.extend(historical)
+        _cache_save('napsis_historico', historical, hist_globs)
+
+    # ── Año actual: siempre fresco (nunca cacheado) ───────────────────
+    actas_disponibles = ACTAS_DIR.is_dir() and any(ACTAS_DIR.glob('a*_4_*.txt'))
+    if actas_disponibles:
+        print(f'  NAPSIS {CURRENT_YEAR} — leyendo desde Actas (napsis/actas/)...')
+        for rec in _parse_actas(ACTAS_DIR, CURRENT_YEAR):
+            records.append(rec)
+            print(f'  NAPSIS {CURRENT_YEAR} — {rec["grade_name"]:12s} '
+                  f'{rec["vigentes"]:3d} est.  prom {rec["pf_prom"]}')
+    else:
+        year_dir = NAPSIS_DIR / str(CURRENT_YEAR)
+        if year_dir.is_dir():
+            for f in sorted(year_dir.glob('*.xlsx')):
+                m = re.match(r'^(\d{2})A_Notas', f.name)
+                if not m:
+                    continue
+                grade_num = int(m.group(1))
+                rec = _parse_napsis_file(f, CURRENT_YEAR, grade_num)
+                if rec:
+                    records.append(rec)
+                    print(f'  NAPSIS {CURRENT_YEAR} — {rec["grade_name"]:12s} '
+                          f'{rec["vigentes"]:3d} est.  prom {rec["pf_prom"]}')
+
     return records
 
 
@@ -770,6 +830,12 @@ def _periodo_from_folder(name):
 
 
 def read_all_dia():
+    dia_globs = [(DIA_DIR, '**/*.xls'), (DIA_DIR, '**/*.xlsx')]
+    cached = _cache_load('dia', dia_globs)
+    if cached is not None:
+        print(f'  DIA — desde caché ({len(cached)} registros)')
+        return cached
+
     records = []
     if not DIA_DIR.exists():
         return records
@@ -829,6 +895,7 @@ def read_all_dia():
                         print(f'  DIA  {year} [{DIA_PERIODO_LABEL[pkey][:5]}] '
                               f'— {GRADE_NAMES.get(grade):12s} '
                               f'{materia:10s}  {len(students)} est.')
+    _cache_save('dia', records, dia_globs)
     return records
 
 
@@ -919,8 +986,15 @@ def _parse_sepa_pdf(path):
 
 
 def read_all_sepa():
+    sepa_globs = [(SEPA_DIR, '**/*.pdf')]
+    cached = _cache_load('sepa', sepa_globs)
+    if cached is not None:
+        print(f'  SEPA — desde caché ({len(cached)} registros)')
+        return cached
+
     records = []
     if not SEPA_DIR.exists():
+        _cache_save('sepa', records, sepa_globs)
         return records
 
     for folder in sorted(SEPA_DIR.iterdir()):
@@ -962,6 +1036,7 @@ def read_all_sepa():
 
         print(f'  SEPA {sepa_year} — {GRADE_NAMES.get(grade):12s} '
               f'{ok}/{len(pdfs)} PDFs leídos')
+    _cache_save('sepa', records, sepa_globs)
     return records
 
 
@@ -2148,6 +2223,11 @@ def main():
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
+    if '--force' in sys.argv:
+        if CACHE_DIR.exists():
+            shutil.rmtree(CACHE_DIR)
+            print('  Caché eliminado — se re-leerán todas las fuentes.')
+
     print()
     print('═' * 62)
     print(f'  DASHBOARD INSTITUCIONAL — {SCHOOL_NAME}')
@@ -2178,9 +2258,25 @@ def main():
     OUTPUT_FILE.write_text(html, encoding='utf-8')
     print(f'  → {OUTPUT_FILE.name}  ({len(html)//1024} KB)')
 
+    # Publicar en GitHub Pages
+    import subprocess
+    _url = "https://luisgonzaleze001.github.io/Trayectoria-acad-mica-MLB/dashboard_institucional.html"
+    try:
+        _today = date.today().strftime("%Y-%m-%d")
+        subprocess.run(["git", "add", "dashboard_institucional.html"], cwd=BASE_DIR, check=True, capture_output=True)
+        _commit = subprocess.run(["git", "commit", "-m", f"Dashboard actualizado {_today}"], cwd=BASE_DIR, capture_output=True, text=True)
+        if "nothing to commit" not in _commit.stdout:
+            subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, check=True, capture_output=True)
+            print(f'  → Publicado en GitHub Pages')
+        else:
+            print(f'  → Sin cambios nuevos (ya publicado)')
+    except Exception as _e:
+        print(f'  ⚠ No se pudo publicar en GitHub: {_e}')
+
     print()
     print('═' * 62)
     print(f'  ✓  Listo: {OUTPUT_FILE}')
+    print(f'  🌐  {_url}')
     print('═' * 62)
     print()
 
